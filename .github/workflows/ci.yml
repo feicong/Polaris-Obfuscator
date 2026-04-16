@@ -1,0 +1,250 @@
+# Copyright (c) 2025-2026 fei_cong(https://github.com/feicong/feicong-course)
+
+name: ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Target release tag (leave empty to use "latest")
+        required: false
+        default: "latest"
+        type: string
+      upload:
+        description: Upload artifacts to Release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            runs_on: ubuntu-22.04
+            archive_ext: tar.xz
+          - label: macos
+            runs_on: macos-14
+            archive_ext: tar.xz
+          - label: windows
+            runs_on: windows-2022
+            archive_ext: zip
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja cmake
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          choco install ninja --yes --no-progress
+
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake_args=(
+            -S src/llvm
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+            -DLLVM_ENABLE_PROJECTS="clang"
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
+            -DLLVM_ENABLE_ASSERTIONS=OFF
+            -DLLVM_INCLUDE_TESTS=OFF
+            -DLLVM_BUILD_TESTS=OFF
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
+            -DLLVM_BUILD_BENCHMARKS=OFF
+            -DLLVM_BUILD_DOCS=OFF
+            -DLLVM_ENABLE_BACKTRACES=OFF
+            -DLLVM_ENABLE_ZLIB=OFF
+            -DLLVM_ENABLE_ZSTD=OFF
+            -DLLVM_ENABLE_LIBXML2=OFF
+            -DLLVM_ENABLE_TERMINFO=OFF
+            -DLLVM_ENABLE_LIBEDIT=OFF
+            -DBUILD_SHARED_LIBS=OFF
+          )
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cmake_args+=(-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+          fi
+
+          cmake "${cmake_args[@]}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel
+
+      - name: Install
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --install build
+
+      - name: Compute archive name
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="${{ github.event.inputs.release_tag }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="latest"
+          fi
+          release_tag_safe="$(printf '%s' "$release_tag" | sed 's/[^A-Za-z0-9._-]/-/g')"
+
+          case "${RUNNER_OS}" in
+            Linux)
+              case "$(uname -m)" in
+                x86_64)   host="x86_64-linux-gnu" ;;
+                aarch64)  host="aarch64-linux-gnu" ;;
+                *)        host="$(uname -m)-linux-gnu" ;;
+              esac
+              archive_name="polaris-obfuscator-${release_tag_safe}-${host}.tar.xz"
+              ;;
+            macOS)
+              case "$(uname -m)" in
+                x86_64) host="x86_64-apple-darwin" ;;
+                arm64)  host="aarch64-apple-darwin" ;;
+                *)      host="$(uname -m)-apple-darwin" ;;
+              esac
+              archive_name="polaris-obfuscator-${release_tag_safe}-${host}.tar.xz"
+              ;;
+            Windows)
+              case "${PROCESSOR_ARCHITECTURE}" in
+                AMD64) host="x86_64-pc-windows-msvc" ;;
+                ARM64) host="aarch64-pc-windows-msvc" ;;
+                *)     host="unknown-pc-windows-msvc" ;;
+              esac
+              archive_name="polaris-obfuscator-${release_tag_safe}-${host}.zip"
+              ;;
+          esac
+
+          {
+            echo "archive_name=${archive_name}"
+            echo "archive_path=${GITHUB_WORKSPACE}/${archive_name}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C "$GITHUB_WORKSPACE" -cJf "${{ steps.archive.outputs.archive_path }}" install
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installDir  = Join-Path $env:GITHUB_WORKSPACE "install"
+          $archiveName = "${{ steps.archive.outputs.archive_name }}"
+          $archivePath = Join-Path $env:GITHUB_WORKSPACE $archiveName
+          Compress-Archive -Path $installDir -DestinationPath $archivePath -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-build
+          path: ${{ steps.archive.outputs.archive_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: ${{ github.event.inputs.upload == 'true' }}
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${{ github.event.inputs.release_tag }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="latest"
+          fi
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Update release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${{ steps.vars.outputs.release_tag }}" "${{ github.sha }}"
+          git push origin "refs/tags/${{ steps.vars.outputs.release_tag }}" --force
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Polaris-Obfuscator ${{ steps.vars.outputs.release_tag }}
+          body: |
+            **Branch:** `${{ github.ref_name }}`
+            **Commit:** `${{ github.sha }}`
+
+            Pre-built binaries for Linux, macOS, and Windows.
+
+            ### Usage
+            Extract the archive and use `clang` from the `bin/` directory:
+            ```bash
+            clang -mllvm -passes=fla,indcall test.cpp -o test
+            ```
+          files: release-assets/*
+          make_latest: true
